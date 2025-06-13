@@ -16,6 +16,8 @@ import random
 import html
 import cv2
 import numpy as np
+import moviepy.editor as mpy
+import tempfile
 
 st.set_page_config(page_title="블로그 AI 숏폼 생성기", page_icon="✨")
 
@@ -325,6 +327,192 @@ def text_to_speech(text, voice_id="uyVNoMrnUku1dZyVEXwD", model_id="eleven_multi
         st.error(f"TTS 변환 실패: {str(e)}")
         return None, {"duration": 10}
 
+def create_video_from_pairs(pairs, output_path='output.mp4'):
+    """
+    흥미로운 부분 쌍(이미지, 오디오, 텍스트) 리스트를 받아 9:16 비율 영상으로 생성합니다.
+    - 이미지가 9:16이 아니면 검은 배경에 중앙 배치
+    - 텍스트(한글) 자막 삽입
+    - 오디오와 싱크 맞춤
+    - 모든 쌍을 이어붙여 하나의 영상으로 만듦
+    """
+    W, H = 720, 1280  # 9:16 비율
+    # macOS 한글 폰트 경로 최우선 추가
+    font_candidates = [
+        '/System/Library/Fonts/AppleSDGothicNeo.ttc',  # macOS 기본 한글 폰트
+        '/Library/Fonts/AppleGothic.ttf',
+        '/Users/chloepark/Library/Fonts/NanumGothic.ttf',
+        '/usr/share/fonts/truetype/nanum/NanumGothic.ttf',
+        '/usr/share/fonts/truetype/nanum/NanumBarunGothic.ttf',
+        '/usr/share/fonts/truetype/malgun/MalgunGothic.ttf',
+        '/usr/share/fonts/truetype/unfonts-core/UnDotum.ttf',
+        '/usr/share/fonts/truetype/freefont/FreeSans.ttf',
+        './NanumGothic.ttf'
+    ]
+    font_path = None
+    for path in font_candidates:
+        if os.path.exists(path):
+            font_path = path
+            break
+    font_size = 40
+    clips = []
+    audio_clips = []
+    audio_paths = []
+
+    # 1차 패스: 각 이미지별로 줄바꿈이 가능한 최소 폰트 크기 계산
+    min_font_size_global = font_size
+    all_lines = []
+    font_sizes = []
+    for idx, pair in enumerate(pairs):
+        text = pair['text']
+        min_font_size_local = font_size
+        lines = []
+        for font_size in range(font_size, 24 - 1, -2):
+            if font_path:
+                font = ImageFont.truetype(font_path, font_size)
+            else:
+                font = ImageFont.load_default()
+            words = text.split()
+            lines = []
+            current_line = ""
+            for word in words:
+                test_line = current_line + (" " if current_line else "") + word
+                bbox = ImageDraw.Draw(Image.new('RGB', (W, H))).textbbox((0, 0), test_line, font=font)
+                text_w = bbox[2] - bbox[0]
+                if text_w > W - 2 * 40:
+                    if current_line:
+                        lines.append(current_line)
+                    current_line = word
+                else:
+                    current_line = test_line
+            if current_line:
+                lines.append(current_line)
+            if len(lines) <= 3:
+                min_font_size_local = font_size
+                break
+        all_lines.append(lines)
+        font_sizes.append(min_font_size_local)
+        if min_font_size_local < min_font_size_global:
+            min_font_size_global = min_font_size_local
+
+    # 2차 패스: 실제 자막 그리기(모든 이미지에 대해 min_font_size_global로 고정)
+    for idx, pair in enumerate(pairs):
+        # 1. 이미지 다운로드 및 9:16 비율 맞추기
+        try:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+                "Referer": "https://blog.naver.com/",
+                "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
+                "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
+                "Cache-Control": "no-cache",
+                "sec-fetch-dest": "image",
+                "sec-fetch-mode": "no-cors",
+                "sec-fetch-site": "cross-site"
+            }
+            response = requests.get(pair['image_url'], headers=headers, timeout=10, allow_redirects=True)
+            img = Image.open(BytesIO(response.content)).convert('RGB')
+        except Exception as e:
+            # 실패 시 검은 배경
+            img = Image.new('RGB', (W, H), (0, 0, 0))
+
+        # 이미지 리사이즈 및 중앙 배치
+        img_ratio = img.width / img.height
+        target_ratio = W / H
+        if abs(img_ratio - target_ratio) > 0.01:
+            # 검은 배경 생성
+            bg = Image.new('RGB', (W, H), (0, 0, 0))
+            # 이미지 크기 조정 (긴 쪽을 맞춤)
+            if img_ratio > target_ratio:
+                # 이미지가 더 넓음
+                new_w = W
+                new_h = int(W / img_ratio)
+            else:
+                # 이미지가 더 높음
+                new_h = H
+                new_w = int(H * img_ratio)
+            img_resized = img.resize((new_w, new_h), Image.LANCZOS)
+            # 중앙 배치
+            x = (W - new_w) // 2
+            y = (H - new_h) // 2
+            bg.paste(img_resized, (x, y))
+            img = bg
+        else:
+            img = img.resize((W, H), Image.LANCZOS)
+
+        # 2. 텍스트 자막 합성 (하단 1/3 지점, 크게, 그림자, 자동 줄바꿈)
+        draw = ImageDraw.Draw(img)
+        if font_path:
+            font = ImageFont.truetype(font_path, min_font_size_global)
+        else:
+            font = ImageFont.load_default()
+            print("❌ 한글 폰트를 찾을 수 없습니다. 반드시 '/System/Library/Fonts/AppleSDGothicNeo.ttc' 또는 한글 지원 폰트를 설치하세요!")
+        text = pair['text']
+        # 동일한 줄바꿈 로직 적용
+        words = text.split()
+        lines = []
+        current_line = ""
+        for word in words:
+            test_line = current_line + (" " if current_line else "") + word
+            bbox = draw.textbbox((0, 0), test_line, font=font)
+            text_w = bbox[2] - bbox[0]
+            if text_w > W - 2 * 40:
+                if current_line:
+                    lines.append(current_line)
+                current_line = word
+            else:
+                current_line = test_line
+        if current_line:
+            lines.append(current_line)
+        lines = lines[:3]
+        # 전체 자막 높이 계산
+        line_heights = [draw.textbbox((0, 0), line, font=font)[3] - draw.textbbox((0, 0), line, font=font)[1] for line in lines]
+        total_text_height = sum(line_heights) + (len(lines) - 1) * 10
+        y_pos = H - (H // 3) - (total_text_height // 2)
+        for i, line in enumerate(lines):
+            bbox = draw.textbbox((0, 0), line, font=font)
+            text_w = bbox[2] - bbox[0]
+            text_h = bbox[3] - bbox[1]
+            x_pos = (W - text_w) // 2
+            y_line = y_pos + sum(line_heights[:i]) + i * 10
+            shadow_offsets = [(-2, -2), (2, -2), (-2, 2), (2, 2), (0, 2), (0, -2), (2, 0), (-2, 0)]
+            for ox, oy in shadow_offsets:
+                draw.text((x_pos + ox, y_line + oy), line, font=font, fill=(0, 0, 0))
+            draw.text((x_pos, y_line), line, font=font, fill=(255, 255, 255))
+
+        # 3. 오디오(base64) -> 임시 파일로 저장
+        audio_data = pair.get('audio_data')
+        if not audio_data:
+            continue  # 오디오 없으면 스킵
+        audio_bytes = base64.b64decode(audio_data)
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp3') as audio_file:
+            audio_file.write(audio_bytes)
+            audio_path = audio_file.name
+        audio_clip = mpy.AudioFileClip(audio_path)
+        duration = audio_clip.duration
+        frame = np.array(img)
+        video_clip = mpy.ImageClip(frame).set_duration(duration).set_audio(audio_clip)
+        clips.append(video_clip)
+        audio_clips.append(audio_clip)
+        audio_paths.append(audio_path)
+
+    if not clips:
+        return None
+
+    # 5. 모든 쌍의 영상 클립을 이어붙여 하나의 영상으로 합침
+    final_clip = mpy.concatenate_videoclips(clips, method="compose")
+    final_clip.write_videofile(output_path, fps=24, codec='libx264', audio_codec='aac')
+    final_clip.close()
+
+    # 오디오 클립 및 임시 파일 정리 (write_videofile 이후)
+    for ac in audio_clips:
+        ac.close()
+    for ap in audio_paths:
+        try:
+            os.remove(ap)
+        except Exception:
+            pass
+
+    return output_path
+
 def main():
     """메인 Streamlit 앱"""
     st.title("블로그 크롤링 테스트")
@@ -444,7 +632,13 @@ def main():
         if st.session_state.show_interesting:
             st.subheader("🎯 흥미로운 부분")
             interesting_pairs = extract_interesting_pairs(st.session_state.content_elements)
-            
+
+            # 각 쌍에 대해 TTS(audio_data) 미리 생성 및 저장
+            for pair in interesting_pairs:
+                if 'audio_data' not in pair or not pair.get('audio_data'):
+                    audio_data, audio_info = text_to_speech(pair['text'])
+                    pair['audio_data'] = audio_data
+
             # 음성 생성 상태 표시
             audio_status = st.empty()
             
@@ -456,8 +650,8 @@ def main():
                     # 음성 생성 중 표시
                     audio_status.info("🎵 음성을 생성하고 있습니다...")
                     
-                    # TTS 생성
-                    audio_data, audio_info = text_to_speech(pair['text'])
+                    # TTS 생성 (이미 위에서 생성됨)
+                    audio_data = pair.get('audio_data')
                     if audio_data:
                         # 음성 재생 컨트롤 표시
                         st.audio(f"data:audio/mpeg;base64,{audio_data}", format='audio/mp3')
@@ -504,6 +698,33 @@ def main():
                         st.error(f"❌ 이미지 로딩 실패: {str(e)}")
                         st.write(f"URL: {pair['image_url']}")
                     st.write("---")
+
+            # 비디오 생성 버튼 추가
+            if st.button("🎬 비디오 생성", type="primary"):
+                with st.spinner("비디오를 생성 중입니다..."):
+                    video_pairs = [p for p in interesting_pairs if p.get('audio_data')]
+                    if not video_pairs:
+                        st.error("오디오가 포함된 쌍이 없습니다. 비디오를 생성할 수 없습니다.")
+                    else:
+                        output_path = "output.mp4"
+                        result = create_video_from_pairs(video_pairs, output_path=output_path)
+                        if result:
+                            with open(output_path, "rb") as f:
+                                video_bytes = f.read()
+                            st.session_state['video_bytes'] = video_bytes
+                            st.success("비디오 생성이 완료되었습니다!")
+                        else:
+                            st.error("비디오 생성에 실패했습니다.")
+
+            # 비디오가 세션에 있으면 항상 표시
+            if 'video_bytes' in st.session_state and st.session_state['video_bytes']:
+                st.video(st.session_state['video_bytes'])
+                st.download_button(
+                    label="비디오 다운로드",
+                    data=st.session_state['video_bytes'],
+                    file_name="output.mp4",
+                    mime="video/mp4"
+                )
 
 if __name__ == "__main__":
     main()
